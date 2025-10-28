@@ -6,8 +6,30 @@ import json
 import numpy as np
 from i18n import TRANSLATIONS, t, metric_keys
 import os
+import sys
+from pathlib import Path
+import importlib.util
 import requests
 from urllib.parse import urlencode
+
+_PROJECT_ROOT = Path(__file__).resolve().parent
+_COMPONENT_DIR = _PROJECT_ROOT / "dragdrop_component"
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
+try:
+    from dragdrop_component import dragdrop_board
+except ModuleNotFoundError:
+    dragdrop_board = None
+    if _COMPONENT_DIR.exists():
+        spec = importlib.util.spec_from_file_location(
+            "dragdrop_component", _COMPONENT_DIR / "__init__.py"
+        )
+        if spec and spec.loader:
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[spec.name] = module
+            spec.loader.exec_module(module)
+            dragdrop_board = getattr(module, "dragdrop_board", None)
 
 # Facebook Ads API imports
 from facebook_business.api import FacebookAdsApi
@@ -215,21 +237,31 @@ def fetch_ad_data(_api_init_params, ad_account_id, start_date, end_date):
 
 @st.cache_data(ttl=3600)
 def fetch_daily_data(_api_init_params, ad_account_id, start_date, end_date):
-    fields = [AdsInsights.Field.date_start, AdsInsights.Field.clicks,
-              AdsInsights.Field.impressions, "actions"]
+    fields = [
+        AdsInsights.Field.date_start,
+        AdsInsights.Field.clicks,
+        AdsInsights.Field.impressions,
+        AdsInsights.Field.spend,
+        "actions",
+    ]
     df = fetch_insights(ad_account_id, "account", fields, start_date, end_date, time_increment=1)
     df = derive_landing_page_views(df)
     df = derive_msg_starts(df)  # <-- add this
-    df = to_numeric(df, ["clicks","impressions","landing_page_view","messaging_conversation_starts"])
+    df = to_numeric(df, ["clicks","impressions","spend","landing_page_view","messaging_conversation_starts"])
     return df
 
 @st.cache_data(ttl=3600)
 def fetch_breakdown_data(_api_init_params, ad_account_id, start_date, end_date, breakdown_type):
     """Fetch data with specific breakdown"""
-    fields = [AdsInsights.Field.clicks, AdsInsights.Field.impressions, "actions"]
+    fields = [
+        AdsInsights.Field.clicks,
+        AdsInsights.Field.impressions,
+        AdsInsights.Field.spend,
+        "actions",
+    ]
     df = fetch_insights(ad_account_id, "account", fields, start_date, end_date, breakdowns=[breakdown_type])
     df = derive_landing_page_views(df)
-    df = to_numeric(df, ["clicks","impressions","landing_page_view"])
+    df = to_numeric(df, ["clicks","impressions","spend","landing_page_view"])
     return df
 
 @st.cache_data(ttl=3600)
@@ -605,6 +637,8 @@ def main():
 
         selected_label = st.selectbox("Select Account", acct_opts, index=0, label_visibility="collapsed")
         selected_ad_account_id = acct_id_map[selected_label]
+        selected_account_meta = next((a for a in st.session_state.fb_ad_accounts if a.get("id") == selected_ad_account_id), {})
+        account_currency = selected_account_meta.get("currency", "USD")
 
         # Language selection
         st.markdown("---")
@@ -925,9 +959,10 @@ def main():
         L_current('tab_ads'),
         L_current('tab_demographics'),
         L_current('tab_devices'),
-        L_current('winners_tab')
+        L_current('winners_tab'),
+        L_current('tab_custom_dashboard')
     ]
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(tab_names)
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(tab_names)
     
     # ========== Overview Tab ==========
     with tab1:
@@ -1462,6 +1497,318 @@ def main():
         else:
             st.warning(L_current('no_ads'))
     
+    # ========== Custom Dashboard Builder Tab ==========
+    with tab7:
+        st.subheader(L_current('custom_tab_title'))
+        st.caption(L_current('custom_tab_description'))
+
+        tile_definitions = [
+            {"id": "total_spend", "label": L_current('total_spend'), "span": 1},
+            {"id": "total_clicks", "label": L_current('total_clicks'), "span": 1},
+            {"id": "total_impressions", "label": L_current('total_impressions'), "span": 1},
+            {"id": "total_reach", "label": L_current('total_reach'), "span": 1},
+            {"id": "landing_page_views", "label": L_current('landing_page_views'), "span": 1},
+            {"id": "total_conversations", "label": L_current('total_conversations'), "span": 1},
+            {"id": "avg_ctr", "label": L_current('avg_ctr'), "span": 1},
+            {"id": "avg_cpc", "label": L_current('avg_cpc'), "span": 1},
+            {"id": "daily_trend", "label": L_current('custom_daily_trend'), "span": 2},
+            {"id": "campaign_table", "label": L_current('custom_campaign_summary'), "span": 2},
+            {"id": "platform_breakdown", "label": L_current('custom_platform_breakdown'), "span": 2},
+            {"id": "top_ads", "label": L_current('custom_top_ads'), "span": 2},
+        ]
+
+        tile_map = {tile["id"]: tile for tile in tile_definitions}
+        label_to_id = {tile["label"]: tile["id"] for tile in tile_definitions}
+
+        st.markdown("### " + L_current('custom_tab_builder_title'))
+        option_labels = [tile["label"] for tile in tile_definitions]
+        default_tile_ids = [
+            "total_spend",
+            "total_clicks",
+            "landing_page_views",
+            "total_conversations",
+            "daily_trend",
+            "campaign_table",
+        ]
+        default_labels = [tile_map[t]["label"] for t in default_tile_ids if t in tile_map]
+        selected_labels = st.multiselect(
+            L_current('custom_tab_select_prompt'),
+            options=option_labels,
+            default=st.session_state.get("custom_dashboard_selected_labels", default_labels),
+            key="custom_dashboard_tiles",
+        )
+
+        st.session_state["custom_dashboard_selected_labels"] = selected_labels
+
+        if not selected_labels:
+            st.info(L_current('custom_tab_empty'))
+        else:
+            selected_ids = [label_to_id[label] for label in selected_labels if label in label_to_id]
+            stored_order = st.session_state.get("custom_dashboard_order", selected_ids)
+            stored_order = [tile_id for tile_id in stored_order if tile_id in selected_ids]
+            stored_order.extend([tile_id for tile_id in selected_ids if tile_id not in stored_order])
+            ordered_labels = [tile_map[tile_id]["label"] for tile_id in stored_order]
+
+            if dragdrop_board is None:
+                st.warning(L_current('custom_tab_component_missing'))
+                new_order_labels = ordered_labels
+            else:
+                board_height = max(220, 72 * len(ordered_labels))
+                new_order_labels = dragdrop_board(
+                    ordered_labels,
+                    height=board_height,
+                    key="custom_dashboard_sortable",
+                )
+            if isinstance(new_order_labels, list) and new_order_labels:
+                stored_order = [label_to_id[label] for label in new_order_labels if label in label_to_id]
+
+            st.session_state["custom_dashboard_order"] = stored_order
+
+            st.caption(L_current('custom_drag_instructions'))
+
+            def format_currency(value: float) -> str:
+                if pd.isna(value):
+                    return "—"
+                return f"{account_currency} {value:,.2f}"
+
+            def format_number(value: float, decimals: int = 0) -> str:
+                if pd.isna(value):
+                    return "—"
+                if decimals == 0:
+                    return f"{int(round(value)):,}"
+                return f"{value:,.{decimals}f}"
+
+            def render_daily_trend(container):
+                if daily_df.empty or daily_df['date_start'].isna().all():
+                    container.info(L_current('custom_tab_no_daily_data'))
+                    return
+
+                metric_options = [
+                    ("clicks", L_current('total_clicks')),
+                    ("impressions", L_current('total_impressions')),
+                    ("landing_page_view", L_current('landing_page_views')),
+                    ("messaging_conversation_starts", L_current('total_conversations')),
+                ]
+                if 'spend' in daily_df.columns:
+                    metric_options.append(("spend", L_current('total_spend')))
+
+                available_options = [opt for opt in metric_options if opt[0] in daily_df.columns]
+                if not available_options:
+                    container.info(L_current('custom_tab_no_daily_data'))
+                    return
+
+                option_labels_local = [label for _, label in available_options]
+                default_label = st.session_state.get("custom_trend_metric_label", option_labels_local[0])
+                selected_label_local = container.selectbox(
+                    L_current('custom_trend_metric_label'),
+                    options=option_labels_local,
+                    index=option_labels_local.index(default_label) if default_label in option_labels_local else 0,
+                    key="custom_trend_metric_select",
+                )
+                st.session_state["custom_trend_metric_label"] = selected_label_local
+                selected_metric_key = next(key for key, label in available_options if label == selected_label_local)
+
+                display_df = daily_df[['date_start', selected_metric_key]].dropna().copy()
+                display_df.sort_values('date_start', inplace=True)
+
+                metric_label = selected_label_local
+                fig = go.Figure()
+                color_key_map = {
+                    'clicks': 'clicks',
+                    'impressions': 'impressions',
+                    'landing_page_view': 'lpv',
+                    'messaging_conversation_starts': 'conversations',
+                    'spend': 'spend',
+                }
+                color_key = color_key_map.get(selected_metric_key, 'clicks')
+                fig.add_trace(
+                    go.Scatter(
+                        x=display_df['date_start'],
+                        y=display_df[selected_metric_key],
+                        mode='lines+markers',
+                        name=metric_label,
+                        line=dict(color=PALETTE['series'].get(color_key, PALETTE['series'].get('clicks')))
+                    )
+                )
+                fig.update_layout(title=metric_label)
+                container.plotly_chart(style_fig(fig, height=380, showlegend=False), use_container_width=True)
+
+            def render_campaign_table(container):
+                if campaigns_df.empty:
+                    container.info(L_current('no_campaign_data'))
+                    return
+
+                summary_cols = [
+                    'campaign_name',
+                    'spend',
+                    'clicks',
+                    'landing_page_view' if 'landing_page_view' in campaigns_df.columns else None,
+                    'messaging_conversation_starts' if 'messaging_conversation_starts' in campaigns_df.columns else None,
+                ]
+                summary_cols = [col for col in summary_cols if col]
+                display_df = campaigns_df[summary_cols].copy()
+                display_df = display_df.groupby('campaign_name', as_index=False).sum(numeric_only=True)
+                display_df.sort_values('spend', ascending=False, inplace=True)
+                display_df.rename(columns={
+                    'campaign_name': 'Campaign',
+                    'spend': f"{account_currency} Spend",
+                    'clicks': 'Clicks',
+                    'landing_page_view': 'Landing Page Views',
+                    'messaging_conversation_starts': 'Conversations',
+                }, inplace=True)
+                display_df[f"{account_currency} Spend"] = display_df[f"{account_currency} Spend"].apply(lambda x: format_currency(x))
+                if 'Landing Page Views' in display_df.columns:
+                    display_df['Landing Page Views'] = display_df['Landing Page Views'].apply(lambda x: format_number(x))
+                display_df['Clicks'] = display_df['Clicks'].apply(lambda x: format_number(x))
+                if 'Conversations' in display_df.columns:
+                    display_df['Conversations'] = display_df['Conversations'].apply(lambda x: format_number(x))
+                container.dataframe(display_df.head(10), use_container_width=True)
+
+            def render_platform_breakdown(container):
+                if platform_df.empty:
+                    container.info(L_current('custom_tab_no_platform_data'))
+                    return
+
+                working_df = platform_df.copy()
+                if 'publisher_platform' not in working_df.columns:
+                    container.info(L_current('custom_tab_no_platform_data'))
+                    return
+
+                agg_df = working_df.groupby('publisher_platform', as_index=False).sum(numeric_only=True)
+                agg_df.sort_values('spend', ascending=False, inplace=True)
+
+                fig = go.Figure()
+                trend_series = 'landing_page_view' if 'landing_page_view' in agg_df.columns else 'clicks'
+                trend_label = L_current('landing_page_views') if trend_series == 'landing_page_view' else L_current('total_clicks')
+                if 'spend' in agg_df.columns:
+                    fig.add_trace(
+                        go.Bar(
+                            x=agg_df['publisher_platform'],
+                            y=agg_df['spend'],
+                            name=L_current('total_spend'),
+                            marker_color=PALETTE['series'].get('spend', PALETTE['categorical'][0]),
+                        )
+                    )
+                fig.add_trace(
+                    go.Bar(
+                        x=agg_df['publisher_platform'],
+                        y=agg_df[trend_series],
+                        name=trend_label,
+                        marker_color=PALETTE['series'].get('lpv' if trend_series == 'landing_page_view' else 'clicks', PALETTE['categorical'][2]),
+                        yaxis='y2' if 'spend' in agg_df.columns else 'y',
+                    )
+                )
+
+                fig.update_layout(
+                    barmode='group' if 'spend' in agg_df.columns else 'relative',
+                    title=L_current('custom_platform_breakdown'),
+                    xaxis_title='Platform',
+                    legend_orientation='h',
+                )
+                if 'spend' in agg_df.columns:
+                    fig.update_layout(
+                        yaxis=dict(title=L_current('total_spend')),
+                        yaxis2=dict(title=trend_label, overlaying='y', side='right')
+                    )
+                else:
+                    fig.update_layout(yaxis=dict(title=trend_label))
+                container.plotly_chart(style_fig(fig, height=420), use_container_width=True)
+
+            metric_column_map = {
+                'landing_page_views': 'landing_page_view',
+                'total_conversations': 'messaging_conversation_starts',
+            }
+            top_ads_metric = metric_column_map.get(metric_key, 'clicks')
+
+            def render_top_ads(container):
+                if ads_df.empty or top_ads_metric not in ads_df.columns:
+                    container.info(L_current('custom_tab_no_ads_data'))
+                    return
+
+                working_df = ads_df.copy()
+                working_df.sort_values(top_ads_metric, ascending=False, inplace=True)
+                extra_metric_cols = []
+                if 'clicks' in working_df.columns and top_ads_metric != 'clicks':
+                    extra_metric_cols.append('clicks')
+                columns = [
+                    'ad_name',
+                    'campaign_name',
+                    top_ads_metric,
+                    *extra_metric_cols,
+                    'spend' if 'spend' in working_df.columns else None,
+                    'ctr' if 'ctr' in working_df.columns else None,
+                    'cpc' if 'cpc' in working_df.columns else None,
+                ]
+                columns = [col for col in columns if col]
+                display_df = working_df[columns].head(10).copy()
+                metric_label = metric_keys_dict.get(metric_key, metric_key)
+                rename_map = {
+                    'ad_name': 'Ad',
+                    'campaign_name': 'Campaign',
+                    top_ads_metric: metric_label,
+                    'clicks': 'Clicks',
+                    'spend': f"{account_currency} Spend",
+                    'ctr': 'CTR %',
+                    'cpc': f"CPC ({account_currency})",
+                }
+                display_df.rename(columns={k: v for k, v in rename_map.items() if k in display_df.columns}, inplace=True)
+
+                if f"{account_currency} Spend" in display_df.columns:
+                    display_df[f"{account_currency} Spend"] = display_df[f"{account_currency} Spend"].apply(lambda x: format_currency(x))
+                if 'CTR %' in display_df.columns:
+                    display_df['CTR %'] = display_df['CTR %'].apply(lambda x: f"{x:.2f}%" if pd.notna(x) else "—")
+                if f"CPC ({account_currency})" in display_df.columns:
+                    display_df[f"CPC ({account_currency})"] = display_df[f"CPC ({account_currency})"].apply(lambda x: format_currency(x) if pd.notna(x) else "—")
+                metric_col_name = metric_keys_dict.get(metric_key, metric_key)
+                if metric_col_name in display_df.columns:
+                    display_df[metric_col_name] = display_df[metric_col_name].apply(lambda x: format_number(x))
+                if 'Clicks' in display_df.columns:
+                    display_df['Clicks'] = display_df['Clicks'].apply(lambda x: format_number(x))
+                container.dataframe(display_df, use_container_width=True)
+
+            def render_metric_card(container, tile_id):
+                if tile_id == 'total_spend':
+                    value = format_currency(total_spend) if not pd.isna(total_spend) else '—'
+                    container.metric(tile_map[tile_id]['label'], value)
+                elif tile_id == 'total_clicks':
+                    container.metric(tile_map[tile_id]['label'], format_number(total_clicks))
+                elif tile_id == 'total_impressions':
+                    container.metric(tile_map[tile_id]['label'], format_number(total_impressions))
+                elif tile_id == 'total_reach':
+                    container.metric(tile_map[tile_id]['label'], format_number(total_reach))
+                elif tile_id == 'landing_page_views':
+                    container.metric(tile_map[tile_id]['label'], format_number(total_landing_page_views))
+                elif tile_id == 'total_conversations':
+                    container.metric(tile_map[tile_id]['label'], format_number(total_messaging_conversation_starts))
+                elif tile_id == 'avg_ctr':
+                    value = '—' if pd.isna(avg_ctr) else f"{avg_ctr:.2f}%"
+                    container.metric(tile_map[tile_id]['label'], value)
+                elif tile_id == 'avg_cpc':
+                    value = format_currency(avg_cpc) if not pd.isna(avg_cpc) else '—'
+                    container.metric(tile_map[tile_id]['label'], value)
+
+            st.markdown("### " + L_current('custom_tab_preview_title'))
+            columns = st.columns(2)
+            col_index = 0
+            for tile_id in stored_order:
+                tile = tile_map[tile_id]
+                span = tile.get('span', 1)
+                if span == 2:
+                    render_target = st.container()
+                    if tile_id == 'daily_trend':
+                        render_daily_trend(render_target)
+                    elif tile_id == 'campaign_table':
+                        render_campaign_table(render_target)
+                    elif tile_id == 'platform_breakdown':
+                        render_platform_breakdown(render_target)
+                    elif tile_id == 'top_ads':
+                        render_top_ads(render_target)
+                    col_index = 0
+                else:
+                    target = columns[col_index % len(columns)]
+                    render_metric_card(target, tile_id)
+                    col_index += 1
+
     # ========== Export Options ==========
     st.markdown("---")
     st.subheader(TRANSLATIONS.get(lang, TRANSLATIONS['en']).get('export_data'))
