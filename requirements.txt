@@ -2,5 +2,4 @@ streamlit>=1.36
 pandas>=2.2
 plotly>=5.24
 facebook-business>=21.0
-streamlit-sortable>=0.2
 python-dateutil>=2.9
