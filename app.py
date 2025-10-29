@@ -1,15 +1,17 @@
-import streamlit as st
-import pandas as pd
-import plotly.graph_objects as go
-from datetime import datetime, timedelta
+from __future__ import annotations
+
 import json
-import numpy as np
-from i18n import TRANSLATIONS, t, metric_keys
 import os
 import sys
 from pathlib import Path
 import importlib.util
+from datetime import datetime, timedelta
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
 import requests
+import streamlit as st
+from streamlit_sortable import sort_items
 from urllib.parse import urlencode
 
 _PROJECT_ROOT = Path(__file__).resolve().parent
@@ -30,6 +32,12 @@ except ModuleNotFoundError:
             sys.modules[spec.name] = module
             spec.loader.exec_module(module)
             dragdrop_board = getattr(module, "dragdrop_board", None)
+from dashboard.widgets import (
+    render_daily_trends,
+    render_kpi_cards,
+    render_platform_distribution,
+)
+from i18n import TRANSLATIONS, metric_keys, t
 
 # Facebook Ads API imports
 from facebook_business.api import FacebookAdsApi
@@ -41,13 +49,256 @@ from facebook_business.adobjects.adcreative import AdCreative
 
 # ========== Theming & Palette (Light/Dark aware) ==========
 import plotly.express as px
-from plotly.colors import sequential, diverging
+from plotly.colors import diverging, sequential
+
+
+def safe_series(df: pd.DataFrame, column: str, default: float = 0.0) -> pd.Series:
+    """Return a dataframe column filled with defaults if missing."""
+
+    if column in df.columns:
+        return df[column].fillna(default)
+    return pd.Series(default, index=df.index, dtype="float64")
+
+
+def format_int(series: pd.Series) -> pd.Series:
+    """Pretty print integer-like columns for Streamlit tables."""
+
+    return series.apply(lambda value: f"{int(value):,}" if pd.notna(value) else "0")
+
+
+def format_currency(series: pd.Series, prefix: str = "", decimals: int = 2) -> pd.Series:
+    """Format numeric values as currency strings."""
+
+    return series.apply(
+        lambda value: f"{prefix}{value:.{decimals}f}" if pd.notna(value) else f"{prefix}0.00"
+    )
+
+
+def format_percentage(series: pd.Series, decimals: int = 2, suffix: str = "%") -> pd.Series:
+    """Format numeric values as percentage strings."""
+
+    default = f"0.{decimals * '0'}{suffix}"
+    return series.apply(
+        lambda value: f"{value:.{decimals}f}{suffix}" if pd.notna(value) else default
+    )
+
+
+def normalize_series(series: pd.Series) -> pd.Series:
+    """Normalize a numeric series to a 0-1 range."""
+
+    max_value = series.max()
+    if pd.isna(max_value) or max_value <= 0:
+        return pd.Series(0, index=series.index, dtype="float64")
+    return series / max_value
+
+
+def format_frequency(series: pd.Series, decimals: int = 1, suffix: str = "x") -> pd.Series:
+    """Format ad frequency values with a trailing multiplier suffix."""
+
+    default = f"0.{decimals * '0'}{suffix}"
+    return series.apply(
+        lambda value: f"{value:.{decimals}f}{suffix}" if pd.notna(value) else default
+    )
+
 
 def get_streamlit_theme_base() -> str:
     try:
         return (st.get_option("theme.base") or "light").lower()
     except Exception:
         return "light"
+
+
+def inject_global_styles(is_dark: bool, palette: dict) -> None:
+    """Inject bespoke dashboard styling to elevate the visual hierarchy."""
+
+    bg_color = "#020617" if is_dark else "#f1f5f9"
+    surface_color = "rgba(15, 23, 42, 0.72)" if is_dark else "rgba(255, 255, 255, 0.86)"
+    border_color = "rgba(148, 163, 184, 0.35)" if is_dark else "rgba(100, 116, 139, 0.25)"
+    subtle_text = "#cbd5f5" if is_dark else "#475569"
+    accent_color = palette["series"].get("clicks", "#3B82F6")
+    highlight_color = palette["series"].get("lpv", "#22C55E")
+
+    st.markdown(
+        f"""
+        <style>
+        :root {{
+            --dashboard-bg: {bg_color};
+            --dashboard-surface: {surface_color};
+            --dashboard-border: {border_color};
+            --dashboard-muted: {subtle_text};
+            --dashboard-accent: {accent_color};
+            --dashboard-highlight: {highlight_color};
+        }}
+
+        [data-testid="stAppViewContainer"] > .main {{
+            background: radial-gradient(circle at 0% 0%, rgba(59, 130, 246, 0.1), transparent 45%),
+                        radial-gradient(circle at 100% 0%, rgba(16, 185, 129, 0.08), transparent 40%),
+                        var(--dashboard-bg);
+        }}
+
+        .dashboard-hero {{
+            background: linear-gradient(135deg, rgba(30, 64, 175, 0.85), rgba(16, 185, 129, 0.85));
+            border-radius: 28px;
+            padding: 32px 40px;
+            display: flex;
+            flex-wrap: wrap;
+            gap: 32px;
+            align-items: center;
+            justify-content: space-between;
+            box-shadow: 0 25px 50px -12px rgba(30, 41, 59, 0.65);
+            color: #ffffff;
+            position: relative;
+            overflow: hidden;
+        }}
+
+        .dashboard-hero::after {{
+            content: "";
+            position: absolute;
+            inset: 0;
+            background: radial-gradient(circle at top right, rgba(255,255,255,0.35), transparent 55%);
+            pointer-events: none;
+        }}
+
+        .dashboard-hero h1 {{
+            margin: 0;
+            font-size: 2.4rem;
+            line-height: 1.1;
+            font-weight: 700;
+        }}
+
+        .dashboard-hero p {{
+            margin-top: 12px;
+            font-size: 1.05rem;
+            max-width: 540px;
+            opacity: 0.88;
+        }}
+
+        .hero-main {{
+            position: relative;
+            z-index: 2;
+            max-width: 620px;
+        }}
+
+        .hero-kicker {{
+            text-transform: uppercase;
+            font-size: 0.78rem;
+            letter-spacing: 0.16em;
+            font-weight: 600;
+            opacity: 0.75;
+            margin-bottom: 12px;
+        }}
+
+        .hero-meta {{
+            display: flex;
+            gap: 16px;
+            flex-wrap: wrap;
+            position: relative;
+            z-index: 2;
+        }}
+
+        .hero-badge {{
+            backdrop-filter: blur(14px);
+            background: rgba(15, 23, 42, 0.35);
+            border: 1px solid rgba(255, 255, 255, 0.28);
+            border-radius: 18px;
+            padding: 16px 20px;
+            min-width: 220px;
+        }}
+
+        .hero-badge span {{
+            display: block;
+        }}
+
+        .hero-badge .badge-label {{
+            font-size: 0.75rem;
+            text-transform: uppercase;
+            letter-spacing: 0.12em;
+            opacity: 0.7;
+        }}
+
+        .hero-badge .badge-value {{
+            font-weight: 600;
+            margin-top: 6px;
+            font-size: 1rem;
+        }}
+
+        .card-divider {{
+            height: 1px;
+            background: rgba(148, 163, 184, 0.35);
+            margin: 28px 0;
+        }}
+
+        .section-divider {{
+            height: 1px;
+            background: linear-gradient(90deg, transparent, rgba(148, 163, 184, 0.35), transparent);
+            margin: 48px 0 32px;
+        }}
+
+        [data-testid="stMetric"] {{
+            background: var(--dashboard-surface);
+            border-radius: 20px;
+            padding: 22px;
+            border: 1px solid var(--dashboard-border);
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.15);
+            backdrop-filter: blur(14px);
+        }}
+
+        [data-testid="stMetric"] [data-testid="stMetricLabel"] {{
+            color: var(--dashboard-muted);
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            font-size: 0.75rem;
+        }}
+
+        [data-testid="stMetric"] [data-testid="stMetricValue"] {{
+            color: inherit;
+            font-size: 1.95rem;
+            font-weight: 700;
+        }}
+
+        [data-baseweb="tab-list"] {{
+            gap: 0.75rem;
+        }}
+
+        button[role="tab"] {{
+            border-radius: 999px !important;
+            padding: 0.65rem 1.35rem !important;
+            background: rgba(15, 23, 42, 0.35) !important;
+            border: 1px solid var(--dashboard-border) !important;
+            color: inherit !important;
+            font-weight: 600;
+            transition: all 0.25s ease;
+        }}
+
+        button[role="tab"][aria-selected="true"] {{
+            background: linear-gradient(135deg, var(--dashboard-accent), var(--dashboard-highlight)) !important;
+            border-color: transparent !important;
+            color: #fff !important;
+            box-shadow: 0 10px 25px -12px rgba(16, 185, 129, 0.8);
+        }}
+
+        div[data-testid="stNotification"] {{
+            border-radius: 16px;
+            border: 1px solid var(--dashboard-border);
+            box-shadow: 0 18px 38px -24px rgba(15, 23, 42, 0.6);
+        }}
+
+        div[data-testid="stDataFrame"] {{
+            border-radius: 22px;
+            border: 1px solid var(--dashboard-border);
+            overflow: hidden;
+            box-shadow: 0 22px 45px -30px rgba(15, 23, 42, 0.65);
+            background: var(--dashboard-surface);
+        }}
+
+        div[data-testid="stDataFrame"] > div:nth-child(2) {{
+            border: none !important;
+        }}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 # ====== Facebook OAuth Config (keep secrets in env or Streamlit secrets) ======
@@ -64,7 +315,7 @@ FB_APP_ID = _cfg("FB_APP_ID")              # None if not set
 FB_APP_SECRET = _cfg("FB_APP_SECRET")      # None if not set
 # IMPORTANT: Set this to the exact public URL of your Streamlit app page
 # e.g. "https://your-domain.app/app" or when testing locally "http://localhost:8501"
-FB_REDIRECT_URI = _cfg("FB_REDIRECT_URI", "http://localhost:8501/")
+FB_REDIRECT_URI = _cfg("FB_REDIRECT_URI", "https://dasmarketing.streamlit.app/")
 FB_SCOPES = ["ads_read"]  # add "business_management" if you need broader listing/asset mgmt
 
 def style_fig(fig, *, height=400, showlegend=True):
@@ -411,6 +662,8 @@ def main():
         "CPC":           PALETTE["series"]["cpc"],
     }
 
+    inject_global_styles(IS_DARK, PALETTE)
+
     # Optional mapping for platform-specific colors (left empty to use default palette)
     platform_colors = {}
 
@@ -606,26 +859,72 @@ def main():
             
             st.stop()
         
-        # ====== If logged in, show account management ======
-        st.header("⚙️ Settings")
+        # ===== Sidebar styling (light card look) =====
+        st.markdown("""
+        <style>
+        /* Sidebar section cards */
+        .sb-row { display: flex; gap: 6px; align-items: center; }
+        .sb-kicker { font-size: 0.8rem; opacity: .7; }
+        .sb-dot {
+            width: 5px; height: 5px;
+            border-radius: 50%;
+            background:#10b981;
+            display:inline-block;
+            margin-right:5px;
+        }
+
+        /* If the quick picks are in the MAIN area */
+        div[data-testid="stHorizontalBlock"] div[data-testid="stButton"] > button {
+            font-size: 0.70rem !important;
+            padding: 2px 6px !important;
+            height: 24px !important;
+            min-width: 48px !important;
+            line-height: 1.1 !important;
+            border-radius: 4px !important;
+        }
+
+        /* If they are in the SIDEBAR instead, use this stricter scope */
+        div[data-testid="stSidebar"] div[data-testid="stHorizontalBlock"] div[data-testid="stButton"] > button {
+            font-size: 0.70rem !important;
+            padding: 2px 6px !important;
+            height: 24px !important;
+            min-width: 48px !important;
+            line-height: 1.1 !important;
+            border-radius: 4px !important;
+        }
         
-        # Show current user
-        col1, col2 = st.columns([3, 1])
-        with col1:
-            st.caption(f"**{st.session_state.fb_user_name}**")
-        with col2:
+        </style>
+        """, unsafe_allow_html=True)
+
+
+
+        # ===== Defaults =====
+        if "data_ready" not in st.session_state:
+            st.session_state.data_ready = False
+        if "last_params" not in st.session_state:
+            st.session_state.last_params = None
+
+
+        # ===== Header / account area =====
+        st.header("⚙️ Settings")
+
+        # top row: user + logout
+        u1, u2 = st.columns([4, 1])
+        with u1:
+            st.caption(f"**{st.session_state.get('fb_user_name','')}**")
+        with u2:
             if st.button("🚪", help="Logout", use_container_width=True):
                 for k in ("fb_user_token", "fb_user_name", "fb_ad_accounts", "data_ready", "last_params"):
                     st.session_state.pop(k, None)
                 st.query_params.clear()
                 st.rerun()
-        
-        st.markdown("---")
-        
-        # Ad Account selection
-        st.subheader("📊 Ad Account")
-        acct_opts = []
-        acct_id_map = {}
+
+
+        # ===== Ad Account =====
+        st.markdown('<div class="sb-card">', unsafe_allow_html=True)
+        st.markdown('<h4>📊 Ad Account</h4>', unsafe_allow_html=True)
+
+        acct_opts, acct_id_map = [], {}
         for a in st.session_state.fb_ad_accounts:
             label = f"{a.get('name','(no name)')} — {a.get('account_id','?')} ({a.get('currency','')})"
             acct_opts.append(label)
@@ -635,80 +934,244 @@ def main():
             st.warning("No ad accounts available")
             st.stop()
 
-        selected_label = st.selectbox("Select Account", acct_opts, index=0, label_visibility="collapsed")
+        selected_label = st.selectbox(
+            "Select Account", acct_opts, index=0, label_visibility="collapsed",
+            help="Choose the ad account to report on"
+        )
         selected_ad_account_id = acct_id_map[selected_label]
         selected_account_meta = next((a for a in st.session_state.fb_ad_accounts if a.get("id") == selected_ad_account_id), {})
         account_currency = selected_account_meta.get("currency", "USD")
+        st.markdown('</div>', unsafe_allow_html=True)
 
-        # Language selection
-        st.markdown("---")
-        lang = st.selectbox('🌐 Language', options=['en', 'zh'], index=0)
-        
-        # Translation helper
-        def L_current(key):
-            try:
-                return TRANSLATIONS.get(lang, TRANSLATIONS['en']).get(key, key)
-            except Exception:
-                return key
-        
-        # Date range
-        st.markdown("---")
-        st.subheader("📅 " + L_current('date_range'))
-        col1, col2 = st.columns(2)
+
+        # ===== Language =====
+        st.markdown('<div class="sb-card">', unsafe_allow_html=True)
+        st.markdown('<h4>🌐 Language</h4>', unsafe_allow_html=True)
+        lang = st.selectbox("Language", options=['en', 'zh'], index=0, label_visibility="collapsed")
+
+        translations = TRANSLATIONS.get(lang, TRANSLATIONS['en'])
+        def L_current(key: str) -> str:
+            return translations.get(key, t('en', key, key))
+        st.markdown('</div>', unsafe_allow_html=True)
+
+
+        # ===== Date range + quick picks =====
+        st.markdown('<div class="sb-card">', unsafe_allow_html=True)
+        st.markdown(f'<h4>📅 {L_current("date_range")}</h4>', unsafe_allow_html=True)
+
+        # --- wrap the buttons inside a <div class="quick-ranges"> container ---
+
+        q1, q2, q3, q4 = st.columns(4)
+        quick_pick = None
+        if q1.button("7d", use_container_width=True): quick_pick = 7
+        if q2.button("30d", use_container_width=True): quick_pick = 30
+        if q3.button("90d", use_container_width=True): quick_pick = 90
+        if q4.button("YTD", use_container_width=True): quick_pick = "ytd"
+
+
         default_end = datetime.now().date()
         default_start = default_end - timedelta(days=30)
-        with col1:
+
+        if quick_pick == 7:
+            default_start, default_end = default_end - timedelta(days=7), default_end
+        elif quick_pick == 30:
+            default_start, default_end = default_end - timedelta(days=30), default_end
+        elif quick_pick == 90:
+            default_start, default_end = default_end - timedelta(days=90), default_end
+        elif quick_pick == "ytd":
+            default_start, default_end = datetime(default_end.year, 1, 1).date(), default_end
+
+        c1, c2 = st.columns(2)
+        with c1:
             start_date = st.date_input("Start", value=default_start, label_visibility="collapsed")
-        with col2:
+        with c2:
             end_date = st.date_input("End", value=default_end, label_visibility="collapsed")
 
-        # Data loading
-        if "data_ready" not in st.session_state:
-            st.session_state.data_ready = False
-        if "last_params" not in st.session_state:
-            st.session_state.last_params = None
+        # simple validation
+        if start_date > end_date:
+            st.error("Start date must be on or before end date.")
 
-        load_clicked = st.button("📥 " + L_current('load_data'), type="primary", use_container_width=True)
+        st.markdown('</div>', unsafe_allow_html=True)   # close sb-card (move this here)
 
-        params_tuple = (selected_ad_account_id, str(start_date), str(end_date))
+        # ===== Metric selection =====
+        st.markdown(f'<h4>🔎 {L_current("metric_select")}</h4>', unsafe_allow_html=True)
+        metric_keys_dict = metric_keys(lang)
+        metric_options = list(metric_keys_dict.values())
+        selected_metric = st.selectbox("Metric", metric_options, index=0, label_visibility="collapsed",
+                                    help="Choose the primary KPI for charts")
+        metric_key = [k for k, v in metric_keys_dict.items() if v == selected_metric][0]
+        st.markdown('</div>', unsafe_allow_html=True)
+
+        widget_options = {
+            "kpi_cards": t(lang, "key_metrics", "Key Performance Metrics"),
+            "daily_trends": t(lang, "daily_trends", "Daily Performance Trends"),
+            "platform_distribution": t(lang, "performance_by_platform", "Performance by Platform"),
+        }
+
+        if "dashboard_layout" not in st.session_state:
+            st.session_state.dashboard_layout = [
+                {"id": widget_id, "metric_key": None} for widget_id in widget_options
+            ]
+
+        normalized_layout = []
+        for item in st.session_state.dashboard_layout:
+            if isinstance(item, str) and item in widget_options:
+                normalized_layout.append({"id": item, "metric_key": None})
+            elif isinstance(item, dict) and item.get("id") in widget_options:
+                normalized_layout.append({"id": item["id"], "metric_key": item.get("metric_key")})
+        if not normalized_layout:
+            normalized_layout = [
+                {"id": widget_id, "metric_key": None} for widget_id in widget_options
+            ]
+        st.session_state.dashboard_layout = normalized_layout
+
+        default_selected_widgets = [item["id"] for item in st.session_state.dashboard_layout]
+
+        st.markdown('<div class="sb-card">', unsafe_allow_html=True)
+        st.markdown(f'<h4>🧩 {L_current("dashboard_layout")}</h4>', unsafe_allow_html=True)
+
+        selected_widgets = st.multiselect(
+            L_current("widget_picker_label"),
+            options=list(widget_options.keys()),
+            default=default_selected_widgets,
+            format_func=lambda wid: widget_options.get(wid, wid),
+        )
+
+        if "dashboard_widget_ids" not in st.session_state:
+            st.session_state.dashboard_widget_ids = default_selected_widgets
+        st.session_state.dashboard_widget_ids = selected_widgets
+
+        layout = [
+            item for item in st.session_state.dashboard_layout if item["id"] in selected_widgets
+        ]
+
+        for widget_id in selected_widgets:
+            if widget_id not in [item["id"] for item in layout]:
+                layout.append({"id": widget_id, "metric_key": None})
+
+        if layout:
+            st.caption(L_current("widget_sort_instruction"))
+            sortable_labels = [widget_options[item["id"]] for item in layout]
+            sorted_labels = sort_items(
+                sortable_labels,
+                direction="vertical",
+                key="dashboard-sortable",
+            )
+            if sorted_labels:
+                title_to_id = {widget_options[item["id"]]: item["id"] for item in layout}
+                new_layout = []
+                for label in sorted_labels:
+                    widget_id = title_to_id.get(label)
+                    if not widget_id:
+                        continue
+                    existing = next((item for item in layout if item["id"] == widget_id), None)
+                    if existing and existing not in new_layout:
+                        new_layout.append(existing)
+                if len(new_layout) == len(layout):
+                    layout = new_layout
+
+            metric_option_keys = ["__global__"] + list(metric_keys_dict.keys())
+            metric_option_labels = {"__global__": L_current("use_global_metric")}
+            metric_option_labels.update({key: metric_keys_dict[key] for key in metric_keys_dict})
+
+            for item in layout:
+                override_default = item.get("metric_key") or "__global__"
+                if override_default not in metric_option_keys:
+                    override_default = "__global__"
+                override_choice = st.selectbox(
+                    f"{widget_options.get(item['id'], item['id'])} - {L_current('custom_metric_label')}",
+                    options=metric_option_keys,
+                    index=metric_option_keys.index(override_default),
+                    format_func=lambda value: metric_option_labels.get(value, value),
+                    key=f"metric-override-{item['id']}",
+                )
+                item["metric_key"] = None if override_choice == "__global__" else override_choice
+
+        st.session_state.dashboard_layout = [item for item in layout]
+
+        layout_json = json.dumps(st.session_state.dashboard_layout, indent=2)
+        st.download_button(
+            L_current("download_layout"),
+            data=layout_json,
+            file_name="dashboard_layout.json",
+            mime="application/json",
+            use_container_width=True,
+        )
+
+        uploaded_layout = st.file_uploader(L_current("upload_layout"), type="json")
+        if uploaded_layout is not None:
+            try:
+                uploaded_data = json.load(uploaded_layout)
+                normalized = []
+                for item in uploaded_data:
+                    if isinstance(item, str) and item in widget_options:
+                        normalized.append({"id": item, "metric_key": None})
+                    elif isinstance(item, dict) and item.get("id") in widget_options:
+                        normalized.append(
+                            {"id": item["id"], "metric_key": item.get("metric_key")}
+                        )
+                if normalized:
+                    st.session_state.dashboard_layout = normalized
+                    st.session_state.dashboard_widget_ids = [
+                        item["id"] for item in normalized
+                    ]
+                    st.success(L_current("layout_import_success"))
+                else:
+                    st.warning(L_current("layout_import_error"))
+            except Exception:
+                st.error(L_current("layout_import_error"))
+
+        st.markdown('</div>', unsafe_allow_html=True)
+
+        # ===== Load data CTA (sticky feel by placing last) =====
+        st.markdown('<div class="sb-row"><span class="sb-dot"></span><span class="sb-kicker">Ready to fetch data</span></div>', unsafe_allow_html=True)
+        load_clicked = st.button("📥 " + L_current('load_data'), type="primary", use_container_width=True,
+                                disabled=(start_date > end_date))
+
+        # update params & readiness
+        params_tuple = (selected_ad_account_id, str(start_date), str(end_date), metric_key, lang)
         if st.session_state.last_params != params_tuple:
             st.session_state.data_ready = False
             st.session_state.last_params = params_tuple
         if load_clicked:
             st.session_state.data_ready = True
+        st.markdown('</div>', unsafe_allow_html=True)
 
-        # Metric selection
-        st.markdown("---")
-        metric_keys_dict = metric_keys(lang)
-        metric_options = list(metric_keys_dict.values())
-        selected_metric = st.selectbox("📊 " + L_current('metric_select'), metric_options, index=0)
-        metric_key = [k for k, v in metric_keys_dict.items() if v == selected_metric][0]
-        
-        # # Optional: Show token for creating profiles
-        # st.markdown("---")
-        # with st.expander("🔑 Access Token"):
-        #     st.text_area(
-        #         "Copy this for profiles (valid ~60 days)", 
-        #         st.session_state.fb_user_token,
-        #         height=80,
-        #         label_visibility="collapsed"
-        #     )
-        #     st.caption("Use this token in `secrets.toml` for profile-based access")
 
     # Header
+    account_badge = selected_label
+    date_summary = f"{start_date.strftime('%d %b %Y')} → {end_date.strftime('%d %b %Y')}"
     st.markdown(
         f"""
-        <div style="display: flex; align-items: center;">
-            <img src="https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcRFVK7PWJ_oV1dYs3YBZJEN2sv0Xw-Gcf-grA&s" width="100">
-            <h1 style="display: inline-block; margin-left: 10px;">Facebook Ads Manager Dashboard</h1>
+        <div class="dashboard-hero">
+            <div class="hero-main">
+                <div class="hero-kicker" style="display: flex; align-items: center; gap: 0.5rem;">
+                    <img src="https://i.imgur.com/m25fSv6.png" 
+                        alt="Company Logo" 
+                        style="height: 28px; border-radius: 6px; margin-right: 6px;">
+                    <span>DA Smarketing Solutions</span>
+                </div>
+                <h1>Facebook Ads Manager Dashboard</h1>
+                <p>Track spend, engagement, and conversion velocity with a polished executive overview.</p>
+            </div>
+            <div class="hero-meta">
+                <div class="hero-badge">
+                    <span class="badge-label">Active Account</span>
+                    <span class="badge-value">{account_badge}</span>
+                </div>
+                <div class="hero-badge">
+                    <span class="badge-label">Reporting Window</span>
+                    <span class="badge-value">{date_summary}</span>
+                </div>
+            </div>
         </div>
         """,
         unsafe_allow_html=True,
     )
-    st.markdown("---")
+    st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
     
     if not st.session_state.data_ready:
-        st.info(TRANSLATIONS.get(lang, TRANSLATIONS['en']).get('select_profile_prompt'))
+        st.info(L_current('select_profile_prompt'))
         
         with st.expander(L_current('getting_started'), expanded=True):
             st.markdown(f"""
@@ -752,7 +1215,7 @@ def main():
 
     
     # Fetch Data
-    with st.spinner(TRANSLATIONS.get(lang, TRANSLATIONS['en']).get('fetching_data')):
+    with st.spinner(L_current('fetching_data')):
         try:
             start_str = start_date.strftime("%Y-%m-%d")
             end_str = end_date.strftime("%Y-%m-%d")
@@ -786,170 +1249,137 @@ def main():
             st.error(f"❌ Error fetching data: {str(e)}")
             st.stop()
     
-    st.success(TRANSLATIONS.get(lang, TRANSLATIONS['en']).get('data_loaded_success'))
-    
-    # ========== Key Metrics ==========
-    st.header(TRANSLATIONS.get(lang, TRANSLATIONS['en']).get('key_metrics'))
-    
-    # Calculate totals
-    total_spend = campaigns_df['spend'].sum() if 'spend' in campaigns_df.columns else 0
-    total_clicks = campaigns_df['clicks'].sum() if 'clicks' in campaigns_df.columns else 0
-    total_impressions = campaigns_df['impressions'].sum() if 'impressions' in campaigns_df.columns else 0
-    total_reach = campaigns_df['reach'].sum() if 'reach' in campaigns_df.columns else 0
-    total_landing_page_views = campaigns_df['landing_page_view'].sum() if 'landing_page_view' in campaigns_df.columns else 0
-    avg_ctr = campaigns_df['ctr'].mean() if 'ctr' in campaigns_df.columns else 0
-    avg_cpc = campaigns_df['cpc'].mean() if 'cpc' in campaigns_df.columns else 0
-    
-    total_messaging_conversation_starts = campaigns_df['messaging_conversation_starts'].sum() if 'messaging_conversation_starts' in campaigns_df.columns else 0
-    
-    col1, col2, col3, col4 = st.columns(4)
-    
-    with col1:
-        st.metric(
-            label=TRANSLATIONS.get(lang, TRANSLATIONS['en']).get('total_spend'),
-            value=f"RM {total_spend:,.2f}",
-            delta=None
-        )
-    
-    with col2:
-        st.metric(
-            label=TRANSLATIONS.get(lang, TRANSLATIONS['en']).get('total_clicks'),
-            value=f"{total_clicks:,}",
-            delta=None
-        )
-    
-    with col3:
-        st.metric(
-            label=TRANSLATIONS.get(lang, TRANSLATIONS['en']).get('landing_page_views'),
-            value=f"{int(total_landing_page_views):,}",
-            delta=None
-        )
-    
-    with col4:
-        st.metric(
-            label=TRANSLATIONS.get(lang, TRANSLATIONS['en']).get('total_reach'),
-            value=f"{total_reach:,}",
-            delta=None
-        )
-    
-    col5, col6, col7, col8 = st.columns(4)
-    
-    with col5:
-        st.metric(
-            label=TRANSLATIONS.get(lang, TRANSLATIONS['en']).get('total_conversations'),
-            value=f"{int(total_messaging_conversation_starts):,}",
-            delta=None
-        )
-    
-    with col6:
-        st.metric(
-            label=TRANSLATIONS.get(lang, TRANSLATIONS['en']).get('total_impressions'),
-            value=f"{total_impressions:,}",
-            delta=None
-        )
-    
-    with col7:
-        st.metric(
-            label=TRANSLATIONS.get(lang, TRANSLATIONS['en']).get('avg_ctr'),
-            value=f"{avg_ctr:.2f}%",
-            delta=None
-        )
-    
-    with col8:
-        st.metric(
-            label=TRANSLATIONS.get(lang, TRANSLATIONS['en']).get('avg_cpc'),
-            value=f"RM {avg_cpc:.2f}",
-            delta=None
-        )
-    
-    # with col8:
-    #     cost_per_lpv = (total_spend / total_landing_page_views) if total_landing_page_views > 0 else 0
-    #     st.metric(
-    #         label="🌐Cost/Landing Page View",
-    #         value=f"RM {cost_per_lpv:.2f}",
-    #         delta=None
-    #     )
-    
-    st.markdown("---")
+    st.success(L_current('data_loaded_success'))
+
+    widget_catalog = {
+        "kpi_cards": {
+            "title": t(lang, "key_metrics", "Key Performance Metrics"),
+            "description": t(
+                lang,
+                "widget_kpi_description",
+                "High-level performance totals for the selected period.",
+            ),
+            "heading": "header",
+            "show_divider": True,
+            "render": lambda widget_metric: render_kpi_cards(
+                campaigns_df=campaigns_df,
+                metric_key=widget_metric,
+                translate=L_current,
+            ),
+        },
+        "daily_trends": {
+            "title": t(lang, "daily_trends", "Daily Performance Trends"),
+            "description": t(
+                lang,
+                "widget_daily_description",
+                "Track daily changes for clicks, impressions, and your primary KPI.",
+            ),
+            "heading": "subheader",
+            "show_divider": True,
+            "render": lambda widget_metric: render_daily_trends(
+                daily_df=daily_df,
+                metric_key=widget_metric,
+                translate=L_current,
+                palette=PALETTE,
+                style_fig=style_fig,
+            ),
+        },
+        "platform_distribution": {
+            "title": t(lang, "performance_by_platform", "Performance by Platform"),
+            "description": t(
+                lang,
+                "widget_platform_description",
+                "Compare engagement volume across placements and surfaces.",
+            ),
+            "heading": "subheader",
+            "show_divider": True,
+            "render": lambda widget_metric: render_platform_distribution(
+                platform_df=platform_df,
+                metric_key=widget_metric,
+                translate=L_current,
+                platform_colors=platform_colors,
+            ),
+        },
+    }
+
+    available_widget_ids = set(widget_catalog.keys())
+    st.session_state.dashboard_layout = [
+        item
+        for item in st.session_state.dashboard_layout
+        if item.get("id") in available_widget_ids
+    ]
     
     # Helper function for ad scoring
-    def score_ads(df):
-        """Calculate composite performance score for ads with expanded metrics"""
-        scores = pd.DataFrame()
-        
-        # Copy needed columns with safe defaults
-        scores['ad_name'] = df['ad_name']
-        scores['campaign_name'] = df['campaign_name']
-        scores['clicks'] = df['clicks'].fillna(0)
-        scores['impressions'] = df['impressions'].fillna(0)
-        scores['landing_page_view'] = df['landing_page_view'].fillna(0) if 'landing_page_view' in df else pd.Series(0, index=df.index)
-        scores['messaging_conversation_starts'] = df['messaging_conversation_starts'].fillna(0) if 'messaging_conversation_starts' in df else pd.Series(0, index=df.index)
-        
-        # Engagement Metrics
-        scores['ctr'] = (100 * scores['clicks'] / scores['impressions']).replace([np.inf, -np.inf], 0).fillna(0)
-        scores['lpv_rate'] = (100 * scores['landing_page_view'] / scores['clicks']).replace([np.inf, -np.inf], 0).fillna(0)
-        scores['conv_rate'] = (100 * scores['messaging_conversation_starts'] / scores['clicks']).replace([np.inf, -np.inf], 0).fillna(0)
-        
-        # Efficiency Metrics
-        scores['cost_per_click'] = (df['cpc'].fillna(0) if 'cpc' in df else pd.Series(0, index=df.index))
-        scores['cost_per_lpv'] = (df['cost_per_lpv'].fillna(0) if 'cost_per_lpv' in df else pd.Series(0, index=df.index))
-        
-        # Volume & Reach Metrics
-        scores['reach'] = df['reach'].fillna(0) if 'reach' in df else scores['impressions']
-        scores['reach_rate'] = (100 * scores['reach'] / scores['impressions']).replace([np.inf, -np.inf], 0).fillna(0)
-        
-        # Frequency Score (penalize too high frequency)
-        scores['frequency'] = (scores['impressions'] / scores['reach']).replace([np.inf, -np.inf], 0).fillna(0)
-        scores['frequency_score'] = 1 - (scores['frequency'] / scores['frequency'].max() if scores['frequency'].max() > 0 else 0)
-        scores['frequency_score'] = scores['frequency_score'].fillna(0)
-        
-        # Normalize metrics to 0-1 scale (inverse for cost metrics)
-        positive_metrics = ['clicks', 'impressions', 'reach', 'ctr', 'lpv_rate', 'conv_rate', 'reach_rate']
-        for col in positive_metrics:
-            max_val = scores[col].max()
-            if max_val > 0:
-                scores[f'{col}_norm'] = scores[col] / max_val
-            else:
-                scores[f'{col}_norm'] = 0
-        
-        # Inverse normalization for cost metrics (lower is better)
-        cost_metrics = ['cost_per_click', 'cost_per_lpv']
-        for col in cost_metrics:
-            max_val = scores[col].max()
-            if max_val > 0:
-                scores[f'{col}_norm'] = 1 - (scores[col] / max_val)
-            else:
-                scores[f'{col}_norm'] = 1  # Best score if no cost
-        
-        # Weighted Composite Score Components
+    def score_ads(df: pd.DataFrame) -> pd.DataFrame:
+        """Calculate composite performance scores for ads with sensible defaults."""
+
+        if df.empty:
+            return df.copy()
+
+        scores = pd.DataFrame(index=df.index)
+        scores['ad_name'] = df.get('ad_name', pd.Series('', index=df.index))
+        scores['campaign_name'] = df.get('campaign_name', pd.Series('', index=df.index))
+
+        clicks = safe_series(df, 'clicks')
+        impressions = safe_series(df, 'impressions')
+        reach = safe_series(df, 'reach')
+        landing_page_view = safe_series(df, 'landing_page_view')
+        conversations = safe_series(df, 'messaging_conversation_starts')
+
+        scores['clicks'] = clicks
+        scores['impressions'] = impressions
+        scores['landing_page_view'] = landing_page_view
+        scores['messaging_conversation_starts'] = conversations
+        scores['reach'] = reach.replace(0, np.nan).fillna(impressions)
+
+        scores['ctr'] = (100 * clicks / impressions).replace([np.inf, -np.inf], 0).fillna(0)
+        scores['lpv_rate'] = (100 * landing_page_view / clicks).replace([np.inf, -np.inf], 0).fillna(0)
+        scores['conv_rate'] = (100 * conversations / clicks).replace([np.inf, -np.inf], 0).fillna(0)
+        scores['reach_rate'] = (100 * scores['reach'] / impressions).replace([np.inf, -np.inf], 0).fillna(0)
+
+        scores['cost_per_click'] = safe_series(df, 'cpc')
+        scores['cost_per_lpv'] = safe_series(df, 'cost_per_lpv')
+
+        scores['frequency'] = (impressions / scores['reach']).replace([np.inf, -np.inf], 0).fillna(0)
+        frequency_max = scores['frequency'].max()
+        if pd.isna(frequency_max) or frequency_max <= 0:
+            scores['frequency_score'] = 0
+        else:
+            scores['frequency_score'] = 1 - (scores['frequency'] / frequency_max)
+            scores['frequency_score'] = scores['frequency_score'].fillna(0)
+
+        for column in ['clicks', 'impressions', 'reach', 'ctr', 'lpv_rate', 'conv_rate', 'reach_rate']:
+            scores[f'{column}_norm'] = normalize_series(scores[column])
+
+        for column in ['cost_per_click', 'cost_per_lpv']:
+            norm = normalize_series(scores[column])
+            scores[f'{column}_norm'] = 1 - norm
+
         engagement_score = (
             scores['ctr_norm'] * 0.4 +
             scores['lpv_rate_norm'] * 0.3 +
             scores['conv_rate_norm'] * 0.3
         )
-        
+
         efficiency_score = (
             scores['cost_per_click_norm'] * 0.5 +
             scores['cost_per_lpv_norm'] * 0.5
         )
-        
+
         volume_score = (
             scores['clicks_norm'] * 0.4 +
             scores['reach_norm'] * 0.3 +
             scores['reach_rate_norm'] * 0.3
         )
-        
-        # Final composite score with component weights
+
         scores['composite_score'] = (
-            engagement_score * 0.4 +      # Engagement quality
-            efficiency_score * 0.3 +      # Cost efficiency
-            volume_score * 0.2 +          # Volume & reach
-            scores['frequency_score'] * 0.1  # Frequency optimization
+            engagement_score * 0.4 +
+            efficiency_score * 0.3 +
+            volume_score * 0.2 +
+            scores['frequency_score'] * 0.1
         )
-        
-        # Scale to 0-100 for easier interpretation
+
         scores['composite_score'] = scores['composite_score'] * 100
-        
         return scores
     
     # ========== Tabs for Different Views ==========
@@ -966,102 +1396,35 @@ def main():
     
     # ========== Overview Tab ==========
     with tab1:
-        st.subheader(TRANSLATIONS.get(lang, TRANSLATIONS['en']).get('daily_trends'))
-        
-        if not daily_df.empty:
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                # Clicks & Impressions over time
-                fig_daily = go.Figure()
-                fig_daily.add_trace(go.Scatter(
-                    x=daily_df['date_start'],
-                    y=daily_df['clicks'],
-                    mode='lines+markers',
-                    name='Clicks',
-                    line=dict(color=PALETTE["series"]["clicks"], width=3)
-                ))
-                fig_daily.add_trace(go.Scatter(
-                    x=daily_df['date_start'],
-                    y=daily_df['impressions'],
-                    mode='lines+markers',
-                    name='Impressions',
-                    yaxis='y2',
-                    line=dict(color=PALETTE["series"]["impressions"], width=3)
-                ))
-                fig_daily.update_layout(
-                    title='Clicks & Impressions Over Time',
-                    xaxis_title='Date',
-                    yaxis_title='Clicks',
-                    yaxis2=dict(title='Impressions', overlaying='y', side='right'),
-                )
-                style_fig(fig_daily, height=400)
-                st.plotly_chart(fig_daily, use_container_width=True)
-            
-            with col2:
-                # Metric over time
-                if metric_key == "landing_page_views":
-                    if 'landing_page_view' in daily_df.columns:
-                        fig_conv = px.bar(
-                            daily_df, x='date_start', y='landing_page_view',
-                            title=L_current('lpv_by_day'),
-                            labels={'date_start': L_current('date_label'), 'landing_page_view': L_current('lpv_label')}
-                        )
-                        fig_conv.update_traces(marker_color=PALETTE["series"]["lpv"])
-                        style_fig(fig_conv, height=400)
-                        st.plotly_chart(fig_conv, use_container_width=True)
-                elif metric_key  == "total_conversations":
-                    if 'messaging_conversation_starts' in daily_df.columns:
-                        fig_msg = px.bar(
-                            daily_df, x='date_start', y='messaging_conversation_starts',
-                            title='Messaging Conversations Started by Day',
-                            labels={'date_start': 'Date', 'messaging_conversation_starts': 'Conversations'}
-                        )
-                        fig_msg.update_traces(marker_color=PALETTE["series"]["conversations"])
-                        style_fig(fig_msg, height=400)
-                        st.plotly_chart(fig_msg, use_container_width=True)
-        
-        st.markdown("---")
-        
-        # Platform Distribution
-        if not platform_df.empty and 'publisher_platform' in platform_df.columns:
-            st.subheader(TRANSLATIONS.get(lang, TRANSLATIONS['en']).get('performance_by_platform'))
-            
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                fig_platform = px.pie(
-                    platform_df,
-                    values='clicks',
-                    names='publisher_platform',
-                    title='Clicks by Platform',
-                    labels={'publisher_platform': 'Platform', 'clicks': 'Clicks'},
-                    hole=0.7,
-                    color='publisher_platform',
-                    color_discrete_map=platform_colors
-                )
-                fig_platform.update_layout(height=400)
-                st.plotly_chart(fig_platform, use_container_width=True)
-            
-            with col2:
-                fig_platform_imp = px.pie(
-                    platform_df,
-                    values='impressions',
-                    names='publisher_platform',
-                    title='Impressions by Platform',
-                    labels={'publisher_platform': 'Platform', 'impressions': 'Impressions'},
-                    hole=0.7,
-                    color='publisher_platform',
-                    color_discrete_map=platform_colors
-                )
-                fig_platform_imp.update_layout(height=400)
-                st.plotly_chart(fig_platform_imp, use_container_width=True)
+        active_layout = st.session_state.dashboard_layout
+
+        if not active_layout:
+            st.info(L_current('no_widgets_selected'))
+        else:
+            for layout_item in active_layout:
+                widget_id = layout_item.get("id")
+                metadata = widget_catalog.get(widget_id)
+                if not metadata:
+                    continue
+
+                widget_metric = layout_item.get("metric_key") or metric_key
+                heading_fn = st.header if metadata.get("heading") == "header" else st.subheader
+
+                with st.container():
+                    heading_fn(metadata["title"])
+                    description = metadata.get("description")
+                    if description:
+                        st.caption(description)
+                    metadata["render"](widget_metric)
+
+                if metadata.get("show_divider", False):
+                    st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
         
         
     # ========== Campaigns Tab ==========
     with tab2:
-        st.subheader(TRANSLATIONS.get(lang, TRANSLATIONS['en']).get('campaign_details'))
-        
+        st.subheader(L_current('campaign_details'))
+
         if not campaigns_df.empty:
             # Display metrics
             display_df = campaigns_df[[
@@ -1074,21 +1437,25 @@ def main():
                 'Landing Page Views', 'Conversations', 'Cost/LPV (RM)', 'CTR (%)', 'CPC (RM)'
             ]
 
-            # Format numbers
-            for col in ['Spend (RM)', 'Cost/LPV (RM)', 'CPC (RM)', 'CTR (%)']:
-                if col in display_df.columns:
-                    display_df[col] = display_df[col].apply(lambda x: f"{x:.2f}" if pd.notna(x) else "0.00")
+            if 'Spend (RM)' in display_df.columns:
+                display_df['Spend (RM)'] = format_currency(display_df['Spend (RM)'])
+            if 'Cost/LPV (RM)' in display_df.columns:
+                display_df['Cost/LPV (RM)'] = format_currency(display_df['Cost/LPV (RM)'])
+            if 'CPC (RM)' in display_df.columns:
+                display_df['CPC (RM)'] = format_currency(display_df['CPC (RM)'])
+            if 'CTR (%)' in display_df.columns:
+                display_df['CTR (%)'] = format_percentage(display_df['CTR (%)'])
 
             for col in ['Reach', 'Impressions', 'Clicks', 'Landing Page Views']:
                 if col in display_df.columns:
-                    display_df[col] = display_df[col].apply(lambda x: f"{int(x):,}" if pd.notna(x) else "0")
+                    display_df[col] = format_int(display_df[col])
 
             st.dataframe(display_df, use_container_width=True, height=400)
-            
+
             # Visualizations
-            st.markdown("---")
+            st.markdown('<div class="card-divider"></div>', unsafe_allow_html=True)
             col1, col2 = st.columns(2)
-            
+
             with col1:
                 fig_spend = px.bar(
                     campaigns_df, x='campaign_name', y='spend',
@@ -1123,11 +1490,13 @@ def main():
 
         else:
             st.warning("No campaign data available for the selected date range.")
+
+        st.markdown('</div>', unsafe_allow_html=True)
     
     # ========== Ads Tab ==========
     with tab3:
-        st.subheader(TRANSLATIONS.get(lang, TRANSLATIONS['en']).get('ads_details'))
-        
+        st.subheader(L_current('ads_details'))
+
         if not ads_df.empty:
             # Display metrics
             # --- Ads Tab table (robust, no length-mismatch) ---
@@ -1164,13 +1533,13 @@ def main():
             }
             display_df = display_df.rename(columns={k: v for k, v in rename_map.items() if k in display_df.columns})
 
-            # Format numeric columns
             for col in ['Impressions', 'Clicks', 'Landing Page Views']:
                 if col in display_df.columns:
-                    display_df[col] = display_df[col].apply(lambda x: f"{int(x):,}" if pd.notna(x) else "0")
-            for col in ['CTR (%)', 'CPC (RM)']:
-                if col in display_df.columns:
-                    display_df[col] = display_df[col].apply(lambda x: f"{x:.2f}" if pd.notna(x) else "0.00")
+                    display_df[col] = format_int(display_df[col])
+            if 'CTR (%)' in display_df.columns:
+                display_df['CTR (%)'] = format_percentage(display_df['CTR (%)'])
+            if 'CPC (RM)' in display_df.columns:
+                display_df['CPC (RM)'] = format_currency(display_df['CPC (RM)'])
 
             # Show with image column
             st.dataframe(
@@ -1181,15 +1550,15 @@ def main():
                     "Preview": st.column_config.ImageColumn("Preview", help="Ad preview image", width="small")
                 }
             )
-            
-            
-            
+
+
+
             # Top performing ads
-            st.markdown("---")
+            st.markdown('<div class="card-divider"></div>', unsafe_allow_html=True)
             col1, col2 = st.columns(2)
-            
+
             with col1:
-                st.subheader(TRANSLATIONS.get(lang, TRANSLATIONS['en']).get('top_10_clicks'))
+                st.subheader(L_current('top_10_clicks'))
                 top_clicks = ads_df.nlargest(10, 'clicks')[['ad_name', 'clicks']]
                 fig_top_clicks = px.bar(
                     top_clicks, x='clicks', y='ad_name', orientation='h',
@@ -1202,7 +1571,7 @@ def main():
             with col2:
                 if metric_key == "landing_page_views":
                     if 'landing_page_view' in ads_df.columns:
-                        st.subheader(TRANSLATIONS.get(lang, TRANSLATIONS['en']).get('top_10_lpv'))
+                        st.subheader(L_current('top_10_lpv'))
                         top_conv = ads_df.nlargest(10, 'landing_page_view')[['ad_name', 'landing_page_view']]
                         fig_top_conv = px.bar(
                             top_conv, x='landing_page_view', y='ad_name', orientation='h',
@@ -1213,7 +1582,7 @@ def main():
                         st.plotly_chart(fig_top_conv, use_container_width=True)
                 elif metric_key == "total_conversations":
                     if 'messaging_conversation_starts' in ads_df.columns:
-                        st.subheader(TRANSLATIONS.get(lang, TRANSLATIONS['en']).get('top_10_conv'))
+                        st.subheader(L_current('top_10_conv'))
                         top_conv = ads_df.nlargest(10, 'messaging_conversation_starts')[['ad_name', 'messaging_conversation_starts']]
                         fig_top_conv = px.bar(
                             top_conv, x='messaging_conversation_starts', y='ad_name', orientation='h',
@@ -1224,16 +1593,18 @@ def main():
                         st.plotly_chart(fig_top_conv, use_container_width=True)
         else:
             st.warning(L_current('no_ads'))
+
+        st.markdown('</div>', unsafe_allow_html=True)
     
     # ========== Demographics Tab ==========
     with tab4:
-        st.subheader(TRANSLATIONS.get(lang, TRANSLATIONS['en']).get('audience_demographics'))
-        
+        st.subheader(L_current('audience_demographics'))
+
         col1, col2 = st.columns(2)
-        
+
         with col1:
             if not age_df.empty and 'age' in age_df.columns:
-                st.subheader(TRANSLATIONS.get(lang, TRANSLATIONS['en']).get('age_distribution'))
+                st.subheader(L_current('age_distribution'))
                 fig_age = px.bar(
                     age_df, x='age', y='clicks',
                     title='Clicks by Age Group',
@@ -1247,12 +1618,12 @@ def main():
                 age_display = age_df[['age', 'clicks', 'impressions']].copy()
                 age_display.columns = ['Age Group', 'Clicks', 'Impressions']
                 for col in ['Clicks', 'Impressions']:
-                    age_display[col] = age_display[col].apply(lambda x: f"{int(x):,}" if pd.notna(x) else "0")
+                    age_display[col] = format_int(age_display[col])
                 st.dataframe(age_display, use_container_width=True)
-        
+
         with col2:
             if not gender_df.empty and 'gender' in gender_df.columns:
-                st.subheader(TRANSLATIONS.get(lang, TRANSLATIONS['en']).get('gender_distribution'))
+                st.subheader(L_current('gender_distribution'))
                 fig_gender = px.pie(
                     gender_df, values='clicks', names='gender',
                     title='Clicks by Gender'
@@ -1266,18 +1637,27 @@ def main():
                 gender_display = gender_df[['gender', 'clicks', 'impressions']].copy()
                 gender_display.columns = ['Gender', 'Clicks', 'Impressions']
                 for col in ['Clicks', 'Impressions']:
-                    gender_display[col] = gender_display[col].apply(lambda x: f"{int(x):,}" if pd.notna(x) else "0")
+                    gender_display[col] = format_int(gender_display[col])
                 st.dataframe(gender_display, use_container_width=True)
+
+        if (
+            age_df.empty or 'age' not in age_df.columns
+        ) and (
+            gender_df.empty or 'gender' not in gender_df.columns
+        ):
+            st.info("No demographic breakdown available for the selected period.")
+
+        st.markdown('</div>', unsafe_allow_html=True)
         
     # ========== Devices & Platforms Tab ==========
     with tab5:
-        st.subheader(TRANSLATIONS.get(lang, TRANSLATIONS['en']).get('device_platform_analytics'))
-        
+        st.subheader(L_current('device_platform_analytics'))
+
         col1, col2 = st.columns(2)
         
         with col1:
             if not device_df.empty and 'impression_device' in device_df.columns:
-                st.subheader(TRANSLATIONS.get(lang, TRANSLATIONS['en']).get('device_breakdown'))
+                st.subheader(L_current('device_breakdown'))
                 fig_device = px.pie(
                     device_df, values='clicks', names='impression_device',
                     title='Clicks by Device'
@@ -1289,12 +1669,12 @@ def main():
                 device_display = device_df[['impression_device', 'clicks', 'impressions']].copy()
                 device_display.columns = ['Device', 'Clicks', 'Impressions']
                 for col in ['Clicks', 'Impressions']:
-                    device_display[col] = device_display[col].apply(lambda x: f"{int(x):,}" if pd.notna(x) else "0")
+                    device_display[col] = format_int(device_display[col])
                 st.dataframe(device_display, use_container_width=True)
         
         with col2:
             if not platform_df.empty and 'publisher_platform' in platform_df.columns:
-                st.subheader(TRANSLATIONS.get(lang, TRANSLATIONS['en']).get('platform_performance'))
+                st.subheader(L_current('platform_performance'))
                 
                 # Calculate CTR for platforms
                 # CTR with divide-by-zero guard
@@ -1345,11 +1725,20 @@ def main():
                 
                 for col in ['Clicks', 'Impressions']:
                     if col in platform_table.columns:
-                        platform_table[col] = platform_table[col].apply(lambda x: f"{int(x):,}" if pd.notna(x) else "0")
+                        platform_table[col] = format_int(platform_table[col])
                 if 'CTR (%)' in platform_table.columns:
-                    platform_table['CTR (%)'] = platform_table['CTR (%)'].apply(lambda x: f"{x:.2f}" if pd.notna(x) else "0.00")
-                
+                    platform_table['CTR (%)'] = format_percentage(platform_table['CTR (%)'])
+
                 st.dataframe(platform_table, use_container_width=True)
+
+        if (
+            device_df.empty or 'impression_device' not in device_df.columns
+        ) and (
+            platform_df.empty or 'publisher_platform' not in platform_df.columns
+        ):
+            st.info("No device or platform analytics available for the selected period.")
+
+        st.markdown('</div>', unsafe_allow_html=True)
 
     # ========== Winners vs Underperformers Tab ==========
     with tab6:
@@ -1421,30 +1810,30 @@ def main():
                         'CPC (RM)', 'Cost/LPV (RM)',
                         'Reach Rate %', 'Frequency'
                     ]
-                    # Format numbers
                     percentage_cols = ['Score', 'CTR %', 'LPV Rate %', 'Conv Rate %', 'Reach Rate %']
                     cost_cols = ['CPC (RM)', 'Cost/LPV (RM)']
-                    for col in percentage_cols:
-                        winners_display[col] = winners_display[col].apply(lambda x: f"{x:.2f}")
+                    winners_display['Score'] = format_percentage(winners_display['Score'], suffix="")
+                    for col in percentage_cols[1:]:
+                        winners_display[col] = format_percentage(winners_display[col])
                     for col in cost_cols:
-                        winners_display[col] = winners_display[col].apply(lambda x: f"RM {x:.2f}")
-                    winners_display['Frequency'] = winners_display['Frequency'].apply(lambda x: f"{x:.1f}x")
+                        winners_display[col] = format_currency(winners_display[col], prefix="RM ")
+                    winners_display['Frequency'] = format_frequency(winners_display['Frequency'])
                     st.dataframe(winners_display, use_container_width=True, height=300)
 
                 with col2:
                     st.subheader(L_current('needs_improve'))
                     underp_display = underperformers[metric_cols].copy()
                     underp_display.columns = winners_display.columns  # Use same column names
-                    # Format numbers
-                    for col in percentage_cols:
-                        underp_display[col] = underp_display[col].apply(lambda x: f"{x:.2f}")
+                    underp_display['Score'] = format_percentage(underp_display['Score'], suffix="")
+                    for col in percentage_cols[1:]:
+                        underp_display[col] = format_percentage(underp_display[col])
                     for col in cost_cols:
-                        underp_display[col] = underp_display[col].apply(lambda x: f"RM {x:.2f}")
-                    underp_display['Frequency'] = underp_display['Frequency'].apply(lambda x: f"{x:.1f}x")
+                        underp_display[col] = format_currency(underp_display[col], prefix="RM ")
+                    underp_display['Frequency'] = format_frequency(underp_display['Frequency'])
                     st.dataframe(underp_display, use_container_width=True, height=300)
 
                 # Performance Distribution Chart
-                st.markdown("---")
+                st.markdown('<div class="card-divider"></div>', unsafe_allow_html=True)
                 st.subheader(L_current('winners_tab') + ' - Performance Score Distribution')
                 
                 fig_scores = px.bar(
@@ -1467,35 +1856,39 @@ def main():
 
                 # Explanation of scoring
                 with st.expander(L_current('winners_tab') + ' - How Score is Calculated'):
-                          st.markdown("""
-                          The performance score (0-100) is calculated using four key components:
-                    
-                          1. Engagement Quality (40% of total score):
-                              - Click-Through Rate (40%)
-                              - Landing Page View Rate (30%)
-                              - Conversation Rate (30%)
-                    
-                          2. Cost Efficiency (30% of total score):
-                              - Cost per Click optimization (50%)
-                              - Cost per Landing Page View optimization (50%)
-                    
-                          3. Volume & Reach (20% of total score):
-                              - Click Volume (40%)
-                              - Audience Reach (30%)
-                              - Reach Rate (30%)
-                    
-                          4. Frequency Optimization (10% of total score):
-                              - Optimal impression frequency score
-                              - Penalizes excessive ad frequency
-                    
-                          Each component is normalized against the best performing ad in the filtered set.
-                          The final score balances engagement, efficiency, scale, and frequency optimization.
-                          Higher scores indicate better overall performance across these dimensions.
-                          """)
+                    st.markdown(
+                        """
+                        The performance score (0-100) is calculated using four key components:
+
+                        1. **Engagement Quality** (40% of total score)
+                           - Click-Through Rate (40%)
+                           - Landing Page View Rate (30%)
+                           - Conversation Rate (30%)
+
+                        2. **Cost Efficiency** (30% of total score)
+                           - Cost per Click optimization (50%)
+                           - Cost per Landing Page View optimization (50%)
+
+                        3. **Volume & Reach** (20% of total score)
+                           - Click Volume (40%)
+                           - Audience Reach (30%)
+                           - Reach Rate (30%)
+
+                        4. **Frequency Optimization** (10% of total score)
+                           - Optimal impression frequency score
+                           - Penalizes excessive ad frequency
+
+                        Each component is normalized against the best performing ad in the filtered set.
+                        The final score balances engagement, efficiency, scale, and frequency optimization.
+                        Higher scores indicate better overall performance across these dimensions.
+                        """
+                    )
             else:
                 st.warning(L_current('no_match'))
         else:
             st.warning(L_current('no_ads'))
+
+        st.markdown('</div>', unsafe_allow_html=True)
     
     # ========== Custom Dashboard Builder Tab ==========
     with tab7:
@@ -1810,16 +2203,16 @@ def main():
                     col_index += 1
 
     # ========== Export Options ==========
-    st.markdown("---")
-    st.subheader(TRANSLATIONS.get(lang, TRANSLATIONS['en']).get('export_data'))
-    
+    st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
+    st.subheader(L_current('export_data'))
+
     col1, col2, col3 = st.columns(3)
     
     with col1:
         if not campaigns_df.empty:
             csv_campaigns = campaigns_df.to_csv(index=False)
             st.download_button(
-                label=TRANSLATIONS.get(lang, TRANSLATIONS['en']).get('download_campaign'),
+                label=L_current('download_campaign'),
                 data=csv_campaigns,
                 file_name=f"campaigns_{start_str}_{end_str}.csv",
                 mime="text/csv"
@@ -1829,7 +2222,7 @@ def main():
         if not ads_df.empty:
             csv_ads = ads_df.to_csv(index=False)
             st.download_button(
-                label=TRANSLATIONS.get(lang, TRANSLATIONS['en']).get('download_ads'),
+                label=L_current('download_ads'),
                 data=csv_ads,
                 file_name=f"ads_{start_str}_{end_str}.csv",
                 mime="text/csv"
@@ -1839,11 +2232,13 @@ def main():
         if not daily_df.empty:
             csv_daily = daily_df.to_csv(index=False)
             st.download_button(
-                label=TRANSLATIONS.get(lang, TRANSLATIONS['en']).get('download_daily'),
+                label=L_current('download_daily'),
                 data=csv_daily,
                 file_name=f"daily_{start_str}_{end_str}.csv",
                 mime="text/csv"
             )
+
+    st.markdown('</div>', unsafe_allow_html=True)
 
 if __name__ == "__main__":
     main()
