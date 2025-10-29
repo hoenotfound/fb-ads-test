@@ -8,8 +8,14 @@ import pandas as pd
 import plotly.graph_objects as go
 import requests
 import streamlit as st
+from streamlit_sortable import sort_items
 from urllib.parse import urlencode
 
+from dashboard.widgets import (
+    render_daily_trends,
+    render_kpi_cards,
+    render_platform_distribution,
+)
 from i18n import TRANSLATIONS, metric_keys, t
 
 # Facebook Ads API imports
@@ -23,6 +29,34 @@ from facebook_business.adobjects.adcreative import AdCreative
 # ========== Theming & Palette (Light/Dark aware) ==========
 import plotly.express as px
 from plotly.colors import diverging, sequential
+
+
+WIDGET_DEFINITIONS = {
+    "kpi_cards": {
+        "title_key": "key_metrics",
+        "description_key": "widget_kpi_description",
+        "fallback_title": "Key Performance Metrics",
+        "fallback_description": "High-level performance totals for the selected period.",
+        "heading": "header",
+        "show_divider": True,
+    },
+    "daily_trends": {
+        "title_key": "daily_trends",
+        "description_key": "widget_daily_description",
+        "fallback_title": "Daily Performance Trends",
+        "fallback_description": "Track daily changes for clicks, impressions, and your primary KPI.",
+        "heading": "subheader",
+        "show_divider": True,
+    },
+    "platform_distribution": {
+        "title_key": "performance_by_platform",
+        "description_key": "widget_platform_description",
+        "fallback_title": "Performance by Platform",
+        "fallback_description": "Compare engagement volume across placements and surfaces.",
+        "heading": "subheader",
+        "show_divider": True,
+    },
+}
 
 
 def safe_series(df: pd.DataFrame, column: str, default: float = 0.0) -> pd.Series:
@@ -461,21 +495,62 @@ def fetch_ad_data(_api_init_params, ad_account_id, start_date, end_date):
 
 @st.cache_data(ttl=3600)
 def fetch_daily_data(_api_init_params, ad_account_id, start_date, end_date):
-    fields = [AdsInsights.Field.date_start, AdsInsights.Field.clicks,
-              AdsInsights.Field.impressions, "actions"]
+    fields = [
+        AdsInsights.Field.date_start,
+        AdsInsights.Field.clicks,
+        AdsInsights.Field.impressions,
+        AdsInsights.Field.spend,
+        AdsInsights.Field.reach,
+        AdsInsights.Field.ctr,
+        AdsInsights.Field.cpc,
+        "actions",
+    ]
     df = fetch_insights(ad_account_id, "account", fields, start_date, end_date, time_increment=1)
     df = derive_landing_page_views(df)
     df = derive_msg_starts(df)  # <-- add this
-    df = to_numeric(df, ["clicks","impressions","landing_page_view","messaging_conversation_starts"])
+    df = to_numeric(
+        df,
+        [
+            "clicks",
+            "impressions",
+            "spend",
+            "reach",
+            "ctr",
+            "cpc",
+            "landing_page_view",
+            "messaging_conversation_starts",
+        ],
+    )
     return df
 
 @st.cache_data(ttl=3600)
 def fetch_breakdown_data(_api_init_params, ad_account_id, start_date, end_date, breakdown_type):
     """Fetch data with specific breakdown"""
-    fields = [AdsInsights.Field.clicks, AdsInsights.Field.impressions, "actions"]
+    fields = [
+        AdsInsights.Field.clicks,
+        AdsInsights.Field.impressions,
+        AdsInsights.Field.spend,
+        AdsInsights.Field.reach,
+        AdsInsights.Field.ctr,
+        AdsInsights.Field.cpc,
+        "actions",
+    ]
     df = fetch_insights(ad_account_id, "account", fields, start_date, end_date, breakdowns=[breakdown_type])
     df = derive_landing_page_views(df)
-    df = to_numeric(df, ["clicks","impressions","landing_page_view"])
+    df = derive_msg_starts(df)
+    df = to_numeric(
+        df,
+        [
+            "clicks",
+            "impressions",
+            "spend",
+            "reach",
+            "ctr",
+            "cpc",
+            "landing_page_view",
+            "messaging_conversation_starts",
+        ],
+    )
     return df
 
 @st.cache_data(ttl=3600)
@@ -963,6 +1038,124 @@ def main():
         metric_key = [k for k, v in metric_keys_dict.items() if v == selected_metric][0]
         st.markdown('</div>', unsafe_allow_html=True)
 
+        widget_options = {
+            widget_id: t(
+                lang,
+                meta["title_key"],
+                meta.get("fallback_title", widget_id.replace("_", " ").title()),
+            )
+            for widget_id, meta in WIDGET_DEFINITIONS.items()
+        }
+
+        if "dashboard_layout" not in st.session_state:
+            st.session_state.dashboard_layout = [
+                {"id": widget_id, "metric_key": None} for widget_id in widget_options
+            ]
+
+        normalized_layout = []
+        for item in st.session_state.dashboard_layout:
+            if isinstance(item, str) and item in widget_options:
+                normalized_layout.append({"id": item, "metric_key": None})
+            elif isinstance(item, dict) and item.get("id") in widget_options:
+                normalized_layout.append({"id": item["id"], "metric_key": item.get("metric_key")})
+        if not normalized_layout:
+            normalized_layout = [
+                {"id": widget_id, "metric_key": None} for widget_id in widget_options
+            ]
+        st.session_state.dashboard_layout = normalized_layout
+
+        default_selected_widgets = [item["id"] for item in st.session_state.dashboard_layout]
+
+        st.markdown('<div class="sb-card">', unsafe_allow_html=True)
+        st.markdown(f'<h4>🧩 {L_current("dashboard_layout")}</h4>', unsafe_allow_html=True)
+
+        selected_widgets = st.multiselect(
+            L_current("widget_picker_label"),
+            options=list(widget_options.keys()),
+            default=default_selected_widgets,
+            format_func=lambda wid: widget_options.get(wid, wid),
+        )
+
+        layout = [
+            item for item in st.session_state.dashboard_layout if item["id"] in selected_widgets
+        ]
+
+        for widget_id in selected_widgets:
+            if widget_id not in [item["id"] for item in layout]:
+                layout.append({"id": widget_id, "metric_key": None})
+
+        if layout:
+            st.caption(L_current("widget_sort_instruction"))
+            sortable_payload = [
+                f"[{item['id']}] {widget_options[item['id']]}" for item in layout
+            ]
+            sorted_values = sort_items(
+                sortable_payload,
+                direction="vertical",
+                key="dashboard-sortable",
+            )
+            if sorted_values:
+                new_layout = []
+                for value in sorted_values:
+                    if not value.startswith("[") or "]" not in value:
+                        continue
+                    widget_id = value[1 : value.index("]")]
+                    existing = next((item for item in layout if item["id"] == widget_id), None)
+                    if existing and existing not in new_layout:
+                        new_layout.append(existing)
+                if len(new_layout) == len(layout):
+                    layout = new_layout
+
+            metric_option_keys = ["__global__"] + list(metric_keys_dict.keys())
+            metric_option_labels = {"__global__": L_current("use_global_metric")}
+            metric_option_labels.update({key: metric_keys_dict[key] for key in metric_keys_dict})
+
+            for item in layout:
+                override_default = item.get("metric_key") or "__global__"
+                if override_default not in metric_option_keys:
+                    override_default = "__global__"
+                override_choice = st.selectbox(
+                    f"{widget_options.get(item['id'], item['id'])} - {L_current('custom_metric_label')}",
+                    options=metric_option_keys,
+                    index=metric_option_keys.index(override_default),
+                    format_func=lambda value: metric_option_labels.get(value, value),
+                    key=f"metric-override-{item['id']}",
+                )
+                item["metric_key"] = None if override_choice == "__global__" else override_choice
+
+        st.session_state.dashboard_layout = [item for item in layout]
+
+        layout_json = json.dumps(st.session_state.dashboard_layout, indent=2)
+        st.download_button(
+            L_current("download_layout"),
+            data=layout_json,
+            file_name="dashboard_layout.json",
+            mime="application/json",
+            use_container_width=True,
+        )
+
+        uploaded_layout = st.file_uploader(L_current("upload_layout"), type="json")
+        if uploaded_layout is not None:
+            try:
+                uploaded_data = json.load(uploaded_layout)
+                normalized = []
+                for item in uploaded_data:
+                    if isinstance(item, str) and item in widget_options:
+                        normalized.append({"id": item, "metric_key": None})
+                    elif isinstance(item, dict) and item.get("id") in widget_options:
+                        normalized.append(
+                            {"id": item["id"], "metric_key": item.get("metric_key")}
+                        )
+                if normalized:
+                    st.session_state.dashboard_layout = normalized
+                    st.success(L_current("layout_import_success"))
+                else:
+                    st.warning(L_current("layout_import_error"))
+            except Exception:
+                st.error(L_current("layout_import_error"))
+
+        st.markdown('</div>', unsafe_allow_html=True)
+
         # ===== Load data CTA (sticky feel by placing last) =====
         st.markdown('<div class="sb-row"><span class="sb-dot"></span><span class="sb-kicker">Ready to fetch data</span></div>', unsafe_allow_html=True)
         load_clicked = st.button("📥 " + L_current('load_data'), type="primary", use_container_width=True,
@@ -1091,82 +1284,53 @@ def main():
     
     st.success(L_current('data_loaded_success'))
 
-    # ========== Key Metrics ==========
-    st.header(L_current('key_metrics'))
+    widget_catalog = {}
+    for widget_id, base_meta in WIDGET_DEFINITIONS.items():
+        widget_catalog[widget_id] = {
+            "title": t(
+                lang,
+                base_meta["title_key"],
+                base_meta.get("fallback_title", widget_id.replace("_", " ").title()),
+            ),
+            "description": t(
+                lang,
+                base_meta.get("description_key", ""),
+                base_meta.get("fallback_description"),
+            )
+            if base_meta.get("description_key")
+            else base_meta.get("fallback_description"),
+            "heading": base_meta.get("heading", "subheader"),
+            "show_divider": base_meta.get("show_divider", False),
+        }
 
-    # Calculate totals
-    total_spend = campaigns_df['spend'].sum() if 'spend' in campaigns_df.columns else 0
-    total_clicks = campaigns_df['clicks'].sum() if 'clicks' in campaigns_df.columns else 0
-    total_impressions = campaigns_df['impressions'].sum() if 'impressions' in campaigns_df.columns else 0
-    total_reach = campaigns_df['reach'].sum() if 'reach' in campaigns_df.columns else 0
-    total_landing_page_views = campaigns_df['landing_page_view'].sum() if 'landing_page_view' in campaigns_df.columns else 0
-    avg_ctr = campaigns_df['ctr'].mean() if 'ctr' in campaigns_df.columns else 0
-    avg_cpc = campaigns_df['cpc'].mean() if 'cpc' in campaigns_df.columns else 0
-    
-    total_messaging_conversation_starts = campaigns_df['messaging_conversation_starts'].sum() if 'messaging_conversation_starts' in campaigns_df.columns else 0
-    
-    col1, col2, col3, col4 = st.columns(4)
-    
-    with col1:
-        st.metric(
-            label=L_current('total_spend'),
-            value=f"RM {total_spend:,.2f}",
-            delta=None
-        )
-    
-    with col2:
-        st.metric(
-            label=L_current('total_clicks'),
-            value=f"{total_clicks:,}",
-            delta=None
-        )
-    
-    with col3:
-        st.metric(
-            label=L_current('landing_page_views'),
-            value=f"{int(total_landing_page_views):,}",
-            delta=None
-        )
-    
-    with col4:
-        st.metric(
-            label=L_current('total_reach'),
-            value=f"{total_reach:,}",
-            delta=None
-        )
-    
-    col5, col6, col7, col8 = st.columns(4)
-    
-    with col5:
-        st.metric(
-            label=L_current('total_conversations'),
-            value=f"{int(total_messaging_conversation_starts):,}",
-            delta=None
-        )
-    
-    with col6:
-        st.metric(
-            label=L_current('total_impressions'),
-            value=f"{total_impressions:,}",
-            delta=None
-        )
-    
-    with col7:
-        st.metric(
-            label=L_current('avg_ctr'),
-            value=f"{avg_ctr:.2f}%",
-            delta=None
-        )
-    
-    with col8:
-        st.metric(
-            label=L_current('avg_cpc'),
-            value=f"RM {avg_cpc:.2f}",
-            delta=None
-        )
+    widget_catalog["kpi_cards"]["render"] = lambda widget_metric: render_kpi_cards(
+        campaigns_df=campaigns_df,
+        metric_key=widget_metric,
+        translate=L_current,
+    )
 
-    st.markdown('</div>', unsafe_allow_html=True)
-    st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
+    widget_catalog["daily_trends"]["render"] = lambda widget_metric: render_daily_trends(
+        daily_df=daily_df,
+        metric_key=widget_metric,
+        translate=L_current,
+        palette=PALETTE,
+        style_fig=style_fig,
+    )
+
+    widget_catalog["platform_distribution"]["render"] = lambda widget_metric: render_platform_distribution(
+        platform_df=platform_df,
+        metric_key=widget_metric,
+        translate=L_current,
+        platform_colors=platform_colors,
+        palette=PALETTE,
+    )
+
+    available_widget_ids = set(widget_catalog.keys())
+    st.session_state.dashboard_layout = [
+        item
+        for item in st.session_state.dashboard_layout
+        if item.get("id") in available_widget_ids
+    ]
     
     # Helper function for ad scoring
     def score_ads(df: pd.DataFrame) -> pd.DataFrame:
@@ -1254,99 +1418,29 @@ def main():
     
     # ========== Overview Tab ==========
     with tab1:
-        st.subheader(L_current('daily_trends'))
+        active_layout = st.session_state.dashboard_layout
 
-        if not daily_df.empty:
-            col1, col2 = st.columns(2)
+        if not active_layout:
+            st.info(L_current('no_widgets_selected'))
+        else:
+            for layout_item in active_layout:
+                widget_id = layout_item.get("id")
+                metadata = widget_catalog.get(widget_id)
+                if not metadata:
+                    continue
 
-            with col1:
-                # Clicks & Impressions over time
-                fig_daily = go.Figure()
-                fig_daily.add_trace(go.Scatter(
-                    x=daily_df['date_start'],
-                    y=daily_df['clicks'],
-                    mode='lines+markers',
-                    name='Clicks',
-                    line=dict(color=PALETTE["series"]["clicks"], width=3)
-                ))
-                fig_daily.add_trace(go.Scatter(
-                    x=daily_df['date_start'],
-                    y=daily_df['impressions'],
-                    mode='lines+markers',
-                    name='Impressions',
-                    yaxis='y2',
-                    line=dict(color=PALETTE["series"]["impressions"], width=3)
-                ))
-                fig_daily.update_layout(
-                    title='Clicks & Impressions Over Time',
-                    xaxis_title='Date',
-                    yaxis_title='Clicks',
-                    yaxis2=dict(title='Impressions', overlaying='y', side='right'),
-                )
-                style_fig(fig_daily, height=400)
-                st.plotly_chart(fig_daily, use_container_width=True)
-            
-            with col2:
-                # Metric over time
-                if metric_key == "landing_page_views":
-                    if 'landing_page_view' in daily_df.columns:
-                        fig_conv = px.bar(
-                            daily_df, x='date_start', y='landing_page_view',
-                            title=L_current('lpv_by_day'),
-                            labels={'date_start': L_current('date_label'), 'landing_page_view': L_current('lpv_label')}
-                        )
-                        fig_conv.update_traces(marker_color=PALETTE["series"]["lpv"])
-                        style_fig(fig_conv, height=400)
-                        st.plotly_chart(fig_conv, use_container_width=True)
-                elif metric_key  == "total_conversations":
-                    if 'messaging_conversation_starts' in daily_df.columns:
-                        fig_msg = px.bar(
-                            daily_df, x='date_start', y='messaging_conversation_starts',
-                            title='Messaging Conversations Started by Day',
-                            labels={'date_start': 'Date', 'messaging_conversation_starts': 'Conversations'}
-                        )
-                        fig_msg.update_traces(marker_color=PALETTE["series"]["conversations"])
-                        style_fig(fig_msg, height=400)
-                        st.plotly_chart(fig_msg, use_container_width=True)
+                widget_metric = layout_item.get("metric_key") or metric_key
+                heading_fn = st.header if metadata.get("heading") == "header" else st.subheader
 
-        st.markdown('</div>', unsafe_allow_html=True)
-        st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
+                with st.container():
+                    heading_fn(metadata["title"])
+                    description = metadata.get("description")
+                    if description:
+                        st.caption(description)
+                    metadata["render"](widget_metric)
 
-        # Platform Distribution
-        if not platform_df.empty and 'publisher_platform' in platform_df.columns:
-            st.subheader(L_current('performance_by_platform'))
-
-            col1, col2 = st.columns(2)
-
-            with col1:
-                fig_platform = px.pie(
-                    platform_df,
-                    values='clicks',
-                    names='publisher_platform',
-                    title='Clicks by Platform',
-                    labels={'publisher_platform': 'Platform', 'clicks': 'Clicks'},
-                    hole=0.7,
-                    color='publisher_platform',
-                    color_discrete_map=platform_colors
-                )
-                fig_platform.update_layout(height=400)
-                st.plotly_chart(fig_platform, use_container_width=True)
-            
-            with col2:
-                fig_platform_imp = px.pie(
-                    platform_df,
-                    values='impressions',
-                    names='publisher_platform',
-                    title='Impressions by Platform',
-                    labels={'publisher_platform': 'Platform', 'impressions': 'Impressions'},
-                    hole=0.7,
-                    color='publisher_platform',
-                    color_discrete_map=platform_colors
-                )
-                fig_platform_imp.update_layout(height=400)
-                st.plotly_chart(fig_platform_imp, use_container_width=True)
-
-            st.markdown('</div>', unsafe_allow_html=True)
+                if metadata.get("show_divider", False):
+                    st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
         
         
     # ========== Campaigns Tab ==========
