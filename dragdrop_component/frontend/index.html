@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <script src="https://unpkg.com/streamlit-component-lib@1.6.0/dist/index.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/sortablejs@1.15.2/Sortable.min.js"></script>
+    <style>
+      :root {
+        --card-bg: #ffffff;
+        --card-border: #e5e7eb;
+        --card-text: #0f172a;
+        --card-shadow: 0 4px 12px rgba(15, 23, 42, 0.1);
+        --card-shadow-active: 0 6px 16px rgba(15, 23, 42, 0.15);
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --card-bg: #1f2937;
+          --card-border: #334155;
+          --card-text: #f1f5f9;
+          --card-shadow: 0 4px 12px rgba(15, 23, 42, 0.35);
+          --card-shadow-active: 0 6px 16px rgba(15, 23, 42, 0.5);
+        }
+      }
+      body {
+        margin: 0;
+        font-family: "Inter", "Segoe UI", system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+        color: var(--card-text);
+      }
+      .board {
+        list-style: none;
+        padding: 0;
+        margin: 0;
+        display: flex;
+        flex-direction: column;
+        gap: 0.65rem;
+      }
+      .board-item {
+        position: relative;
+        background: var(--card-bg);
+        border: 1px solid var(--card-border);
+        border-radius: 14px;
+        padding: 0.9rem 1rem 0.9rem 2.6rem;
+        font-weight: 600;
+        letter-spacing: 0.01em;
+        box-shadow: var(--card-shadow);
+        cursor: grab;
+        transition: box-shadow 0.2s ease, transform 0.2s ease;
+      }
+      .board-item:hover {
+        box-shadow: var(--card-shadow-active);
+        transform: translateY(-1px);
+      }
+      .board-item:active {
+        cursor: grabbing;
+      }
+      .board-item::before {
+        content: "⋮⋮";
+        position: absolute;
+        left: 1.1rem;
+        top: 50%;
+        transform: translateY(-50%);
+        font-size: 1.15rem;
+        opacity: 0.55;
+      }
+      .board-item--ghost {
+        opacity: 0.4;
+      }
+      .board-item--drag {
+        box-shadow: var(--card-shadow-active);
+        transform: scale(1.01);
+      }
+    </style>
+  </head>
+  <body>
+    <ul id="board" class="board"></ul>
+    <script>
+      const { Streamlit } = window;
+      let sortable = null;
+
+      function render(event) {
+        const data = event.detail;
+        const items = data.args.items || [];
+        const height = data.args.height || 320;
+        const board = document.getElementById("board");
+
+        board.innerHTML = "";
+        board.style.minHeight = `${height}px`;
+
+        items.forEach((item) => {
+          const el = document.createElement("li");
+          el.className = "board-item";
+          el.textContent = item;
+          el.dataset.value = item;
+          board.appendChild(el);
+        });
+
+        if (sortable) {
+          sortable.destroy();
+        }
+
+        sortable = Sortable.create(board, {
+          animation: 180,
+          ghostClass: "board-item--ghost",
+          dragClass: "board-item--drag",
+          onEnd: () => {
+            const order = Array.from(board.children).map((child) => child.dataset.value);
+            Streamlit.setComponentValue(order);
+          },
+        });
+
+        const boardHeight = board.getBoundingClientRect().height;
+        Streamlit.setFrameHeight(boardHeight + 16);
+        Streamlit.setComponentValue(items);
+      }
+
+      Streamlit.events.addEventListener(Streamlit.RENDER_EVENT, render);
+      Streamlit.setComponentReady();
+      Streamlit.setFrameHeight(0);
+    </script>
+  </body>
+</html>
